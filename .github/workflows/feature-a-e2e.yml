@@ -1,0 +1,280 @@
+name: Feature A E2E no checkpoint
+
+on:
+  workflow_dispatch:
+    inputs:
+      evidence_recipient:
+        description: Chave publica age1... para criptografar logs e traces
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  feature-a-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CI: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+      SENTRY_DSN: "off"
+      META_GRAPH_BASE_URL: http://127.0.0.1:9
+      META_ADS_GRAPH_BASE_URL: http://127.0.0.1:9
+      NODE_OPTIONS: --max-old-space-size=4096
+      EVIDENCE_RECIPIENT: ${{ inputs.evidence_recipient }}
+    steps:
+      - name: Checkout do commit exato do produto
+        uses: actions/checkout@v7
+        with:
+          repository: oianmaxdev/DeskcommCRM
+          ref: 3cfa294142bffd9901435b9558b68e0c8d137cec
+          persist-credentials: false
+
+      - name: Confirmar identidade do checkout
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '3cfa294142bffd9901435b9558b68e0c8d137cec'
+          test ! -e .env.local
+          test -f .github/actions/preparar-node/action.yml
+          test -f supabase/baseline.sql
+          test -f tests/e2e/conversa-vira-lead.spec.ts
+          test -f tests/e2e/conversoes-reprocessamento.spec.ts
+
+      - name: Preparar criptografia dos artefatos
+        id: encryption
+        run: |
+          set -euo pipefail
+          umask 077
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq age >/dev/null
+          mkdir -p "$RUNNER_TEMP/feature-a-evidence"
+          printf 'teste\n' | age -r "$EVIDENCE_RECIPIENT" -o "$RUNNER_TEMP/feature-a-evidence/recipient-probe.age"
+          test -s "$RUNNER_TEMP/feature-a-evidence/recipient-probe.age"
+          printf '%s\n' 'Criptografia de evidencias pronta.'
+
+      - name: Reservar portas locais do Supabase
+        run: |
+          set -euo pipefail
+          portas=$(grep -oE '^[[:space:]]*(shadow_)?port[[:space:]]*=[[:space:]]*[0-9]+' supabase/config.toml \
+            | grep -oE '[0-9]+$' | sort -un | paste -sd, -)
+          test -n "$portas"
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports="$portas" >/dev/null
+
+      - uses: ./.github/actions/preparar-node
+        timeout-minutes: 5
+
+      - uses: supabase/setup-cli@v3
+        with:
+          version: 2.117.0
+
+      - name: Subir Supabase descartavel sem migrations
+        run: |
+          set -euo pipefail
+          mv supabase/migrations "$RUNNER_TEMP/feature-a-migrations"
+          mkdir -p supabase/migrations
+          log="$RUNNER_TEMP/feature-a-evidence/supabase-start.log"
+          esperas=(0 20 60 120)
+          registros=(ghcr.io public.ecr.aws ghcr.io public.ecr.aws)
+          for tentativa in 1 2 3 4; do
+            espera=${esperas[$((tentativa - 1))]}
+            registro=${registros[$((tentativa - 1))]}
+            tentativa_log="$RUNNER_TEMP/feature-a-evidence/supabase-start-${tentativa}.log"
+            if [ "$espera" -gt 0 ]; then
+              supabase stop --no-backup >> "$log" 2>&1 || true
+              sleep "$espera"
+            fi
+            if SUPABASE_INTERNAL_IMAGE_REGISTRY="$registro" supabase start -x studio,postgres-meta > "$tentativa_log" 2>&1; then
+              cat "$tentativa_log" >> "$log"
+              curl -fsS -o /dev/null http://127.0.0.1:54321/auth/v1/health
+              exit 0
+            fi
+            cat "$tentativa_log" >> "$log"
+            if ! grep -qE 'toomanyrequests|failed to pull docker image|error pulling image|TLS handshake timeout|i/o timeout|connection reset by peer' "$tentativa_log"; then
+              echo 'Supabase local falhou; detalhe no artefato criptografado.' >&2
+              exit 1
+            fi
+          done
+          echo 'Supabase local falhou apos quatro tentativas de download; detalhe no artefato criptografado.' >&2
+          exit 1
+
+      - name: Preparar extensoes, baseline e chave local
+        run: |
+          set -euo pipefail
+          db='postgresql://postgres:postgres@127.0.0.1:54322/postgres'
+          log="$RUNNER_TEMP/feature-a-evidence/baseline.log"
+          psql "$db" -v ON_ERROR_STOP=1 -q > "$log" 2>&1 <<'SQL'
+          create schema if not exists extensions;
+          create extension if not exists "uuid-ossp" with schema extensions;
+          create extension if not exists pgcrypto with schema extensions;
+          create extension if not exists vector with schema public;
+          create extension if not exists citext with schema public;
+          create extension if not exists pg_trgm with schema public;
+          SQL
+          psql "$db" -v ON_ERROR_STOP=1 -q -f supabase/baseline.sql >> "$log" 2>&1
+          psql "$db" -v ON_ERROR_STOP=1 -q \
+            -c "insert into private.app_secrets (name, value) values ('nuvemshop_oauth_key', '$(openssl rand -hex 32)') on conflict (name) do nothing;" \
+            >> "$log" 2>&1
+
+      - name: Reiniciar Realtime depois da publication do baseline
+        run: |
+          set -euo pipefail
+          id=$(docker ps -q --filter name=supabase_realtime)
+          test -n "$id"
+          docker restart "$id" >/dev/null
+          for i in $(seq 1 30); do
+            estado=$(docker inspect -f '{{.State.Health.Status}}' "$id" 2>/dev/null || true)
+            if [ "$estado" = healthy ]; then exit 0; fi
+            sleep 2
+          done
+          echo 'Realtime nao ficou healthy.' >&2
+          exit 1
+
+      - name: Gerar e validar ambiente E2E local
+        run: |
+          set -euo pipefail
+          pnpm e2e:env > "$RUNNER_TEMP/feature-a-evidence/e2e-env.log" 2>&1
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          env = {}
+          for line in Path('.env.e2e').read_text().splitlines():
+              if not line or line.lstrip().startswith('#') or '=' not in line:
+                  continue
+              key, value = line.split('=', 1)
+              env[key] = value
+          expected = {
+              'NEXT_PUBLIC_SUPABASE_URL': ('127.0.0.1', 54321),
+              'SUPABASE_DB_URL': ('127.0.0.1', 54322),
+              'NEXT_PUBLIC_APP_URL': ('localhost', 3001),
+          }
+          for key, (host, port) in expected.items():
+              parsed = urlparse(env.get(key, ''))
+              if parsed.hostname != host or parsed.port != port:
+                  raise SystemExit(f'Destino local invalido: {key}')
+          for key, value in env.items():
+              if key.endswith(('_URL', '_URI', '_HOST', '_ENDPOINT')) and value:
+                  if urlparse(value).hostname not in ('127.0.0.1', 'localhost', '::1'):
+                      raise SystemExit(f'Destino nao local: {key}')
+          if env.get('SENTRY_DSN') != 'off':
+              raise SystemExit('Sentry precisa estar desligado')
+          for key in ('META_GRAPH_BASE_URL', 'META_ADS_GRAPH_BASE_URL'):
+              if urlparse(os.environ.get(key, '')).hostname != '127.0.0.1':
+                  raise SystemExit(f'Destino Meta nao local: {key}')
+          PY
+          grep -vE '^[[:space:]]*(#|$)' .env.e2e >> "$GITHUB_ENV"
+          echo 'Ambiente E2E conferido: somente destinos locais.'
+
+      - name: Build oficial do E2E
+        id: build
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/feature-a-evidence/build.log"
+          mem="$RUNNER_TEMP/feature-a-evidence/memory-build.log"
+          (
+            while :; do
+              date -u +'%Y-%m-%dT%H:%M:%SZ'
+              awk '/^(MemAvailable|SwapTotal|SwapFree):/ {print}' /proc/meminfo
+              ps -eo pid,comm,rss --sort=-rss | head -n 8
+              sleep 10
+            done
+          ) > "$mem" 2>&1 &
+          monitor=$!
+          trap 'kill "$monitor" 2>/dev/null || true' EXIT
+          if ! pnpm e2e:build > "$log" 2>&1; then
+            echo 'Build E2E falhou; detalhe no artefato criptografado.' >&2
+            exit 1
+          fi
+          test -s .next/BUILD_ID
+          test -d .next/server
+          test -d .next/static
+          test -s .next/required-server-files.json
+          if grep -RqlE 'https://[A-Za-z0-9.-]+\.supabase\.co' .next/static; then
+            echo 'Bundle contem host Supabase remoto.' >&2
+            exit 1
+          fi
+          grep -RqlF '127.0.0.1:54321' .next/static
+          echo 'Build e bundle local conferidos.'
+
+      - name: Instalar Chromium e semear apenas as fixtures necessarias
+        run: |
+          set -euo pipefail
+          pnpm exec playwright install --with-deps chromium > "$RUNNER_TEMP/feature-a-evidence/browser-install.log" 2>&1
+          cp .env.e2e .env.local
+          pnpm exec tsx scripts/seed-e2e-credentials.ts > "$RUNNER_TEMP/feature-a-evidence/seed-credentials.log" 2>&1
+          pnpm exec tsx scripts/seed-e2e-nascimento-do-lead.ts > "$RUNNER_TEMP/feature-a-evidence/seed-nascimento.log" 2>&1
+          echo 'Chromium e fixtures sintéticas prontos.'
+
+      - name: Executar somente os dois specs da Feature A
+        id: playwright
+        env:
+          PLAYWRIGHT_HTML_OPEN: never
+          AUTH_RATE_LIMIT_LOGIN_IP: "1000"
+        run: |
+          set -euo pipefail
+          touch "$RUNNER_TEMP/feature-a-evidence/playwright-started"
+          if ! pnpm exec playwright test \
+            tests/e2e/conversa-vira-lead.spec.ts \
+            tests/e2e/conversoes-reprocessamento.spec.ts \
+            --workers=1 --trace=on --reporter=list,html \
+            > "$RUNNER_TEMP/feature-a-evidence/playwright.log" 2>&1; then
+            echo 'Playwright falhou; detalhe no artefato criptografado.' >&2
+            exit 1
+          fi
+          echo 'Os dois arquivos de spec terminaram com exit code 0.'
+
+      - name: Criptografar logs, resultados e traces
+        id: encrypt
+        if: ${{ always() && steps.encryption.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          stage="$RUNNER_TEMP/feature-a-archive"
+          mkdir -p "$stage"
+          cp -R "$RUNNER_TEMP/feature-a-evidence" "$stage/logs"
+          if [ -d test-results ]; then cp -R test-results "$stage/"; fi
+          if [ -d playwright-report ]; then cp -R playwright-report "$stage/"; fi
+          shot=evidence/spec-17/card-nascido-da-conversa.png
+          if [ -f "$RUNNER_TEMP/feature-a-evidence/playwright-started" ] \
+            && [ -f "$shot" ] \
+            && [ "$shot" -nt "$RUNNER_TEMP/feature-a-evidence/playwright-started" ]; then
+            mkdir -p "$stage/screenshots"
+            cp "$shot" "$stage/screenshots/"
+          fi
+          if [ -n "$(find "$stage" -type f \( -name '.env.e2e' -o -name '.env.local' -o -name '.e2e-creds.json' \) -print -quit)" ]; then
+            echo 'Arquivo de credenciais encontrado no pacote; upload recusado.' >&2
+            exit 1
+          fi
+          tar -czf "$RUNNER_TEMP/feature-a-evidence.tar.gz" -C "$stage" .
+          age -r "$EVIDENCE_RECIPIENT" \
+            -o "$RUNNER_TEMP/feature-a-evidence.tar.gz.age" \
+            "$RUNNER_TEMP/feature-a-evidence.tar.gz"
+          test -s "$RUNNER_TEMP/feature-a-evidence.tar.gz.age"
+          echo 'Evidencias criptografadas. Nenhum log ou trace bruto sera publicado.'
+
+      - name: Publicar somente o pacote criptografado
+        if: ${{ always() && steps.encrypt.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: feature-a-e2e-evidencias-criptografadas
+          path: ${{ runner.temp }}/feature-a-evidence.tar.gz.age
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Resumo sem credenciais
+        if: always()
+        env:
+          BUILD_RESULT: ${{ steps.build.outcome }}
+          PLAYWRIGHT_RESULT: ${{ steps.playwright.outcome }}
+          ENCRYPT_RESULT: ${{ steps.encrypt.outcome }}
+        run: |
+          {
+            echo '## Feature A E2E'
+            echo 'Checkpoint: `3cfa294142bffd9901435b9558b68e0c8d137cec`'
+            echo "Build: ${BUILD_RESULT}"
+            echo "Playwright: ${PLAYWRIGHT_RESULT}"
+            echo "Criptografia: ${ENCRYPT_RESULT}"
+            echo 'Artefato: pacote age; nenhum arquivo de ambiente ou credencial foi selecionado.'
+          } >> "$GITHUB_STEP_SUMMARY"
