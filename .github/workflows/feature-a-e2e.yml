@@ -29,13 +29,13 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: oianmaxdev/DeskcommCRM
-          ref: 56e6cb0f551ce9d1e2c58b19cd0b995ff9c9a72a
+          ref: 9cda9e837f124dfaa180a0368e185f89f8b82327
           persist-credentials: false
 
       - name: Confirmar identidade do checkout
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = '56e6cb0f551ce9d1e2c58b19cd0b995ff9c9a72a'
+          test "$(git rev-parse HEAD)" = '9cda9e837f124dfaa180a0368e185f89f8b82327'
           test ! -e .env.local
           test -f .github/actions/preparar-node/action.yml
           test -f supabase/baseline.sql
@@ -406,7 +406,7 @@ jobs:
         run: |
           {
             echo '## Feature A E2E'
-            echo 'Checkpoint: `56e6cb0f551ce9d1e2c58b19cd0b995ff9c9a72a`'
+            echo 'Checkpoint: `9cda9e837f124dfaa180a0368e185f89f8b82327`'
             echo "Typecheck: ${TYPECHECK_RESULT}"
             echo "Build: ${BUILD_RESULT}"
             echo "Causal (dez cenarios): ${CAUSAL_RESULT}"
