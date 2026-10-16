@@ -179,13 +179,67 @@ jobs:
 
       - name: Typecheck completo do produto
         id: typecheck
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
         run: |
           set -euo pipefail
+          evidence="$RUNNER_TEMP/feature-a-evidence"
+          metrics="$evidence/memory-typecheck.log"
+          summary="$evidence/typecheck-metrics.log"
+          started=$(date +%s)
+          pnpm typecheck > "$evidence/typecheck.log" 2>&1 &
+          typecheck_pid=$!
+          (
+            while kill -0 "$typecheck_pid" 2>/dev/null; do
+              date -u +'%Y-%m-%dT%H:%M:%SZ'
+              awk '/^MemAvailable:/ {available=$2} /^SwapTotal:/ {total=$2} /^SwapFree:/ {free=$2} END {printf "MemAvailable_kib=%d\nSwapUsed_kib=%d\n", available, total-free}' /proc/meminfo
+              ps -eo pid=,ppid=,comm=,rss= | awk -v root="$typecheck_pid" '
+                { pid[NR]=$1; parent[NR]=$2; command[NR]=$3; rss[NR]=$4 }
+                END {
+                  seen[root]=1
+                  do {
+                    changed=0
+                    for (i=1; i<=NR; i++) {
+                      if (seen[parent[i]] && !seen[pid[i]]) {
+                        seen[pid[i]]=1
+                        changed=1
+                      }
+                    }
+                  } while (changed)
+                  for (i=1; i<=NR; i++) {
+                    if (seen[pid[i]] && command[i]=="node") {
+                      printf "NodePID=%s NodeRSS_kib=%d\n", pid[i], rss[i]
+                      total+=rss[i]
+                    }
+                  }
+                  printf "NodeRSS_total_kib=%d\n", total
+                }'
+              available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+              if [ "$available_kib" -lt 1048576 ]; then
+                echo 'WARNING: runner MemAvailable abaixo de 1 GiB'
+              fi
+              sleep 10
+            done
+          ) > "$metrics" 2>&1 &
+          monitor=$!
+          trap 'kill "$monitor" 2>/dev/null || true; wait "$monitor" 2>/dev/null || true' EXIT
           set +e
-          pnpm typecheck > "$RUNNER_TEMP/feature-a-evidence/typecheck.log" 2>&1
+          wait "$typecheck_pid"
           code=$?
           set -e
-          printf '%s\n' "$code" > "$RUNNER_TEMP/feature-a-evidence/typecheck.exit-code"
+          kill "$monitor" 2>/dev/null || true
+          wait "$monitor" 2>/dev/null || true
+          trap - EXIT
+          {
+            printf 'duration_seconds=%d\nexit_code=%d\n' "$(( $(date +%s) - started ))" "$code"
+            awk -F= '
+              $1=="MemAvailable_kib" { if (!seen || $2<minimum) minimum=$2; seen=1 }
+              $1=="SwapUsed_kib" && $2>swap_peak { swap_peak=$2 }
+              $1=="NodeRSS_total_kib" && $2>rss_peak { rss_peak=$2 }
+              END { printf "minimum_MemAvailable_kib=%d\npeak_SwapUsed_kib=%d\npeak_NodeRSS_sampled_kib=%d\n", minimum, swap_peak, rss_peak }
+            ' "$metrics"
+          } > "$summary"
+          printf '%s\n' "$code" > "$evidence/typecheck.exit-code"
           if [ "$code" -ne 0 ]; then
             echo 'Typecheck falhou; detalhe no artefato criptografado.' >&2
           fi
