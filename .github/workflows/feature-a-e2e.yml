@@ -58,6 +58,18 @@ jobs:
       - name: Reservar portas locais do Supabase
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          config = Path('supabase/config.toml')
+          original = config.read_text()
+          updated, count = re.subn(r'(?m)^(\[db\]\nport = )54322$',
+                                   r'\g<1>15432', original)
+          if count != 1:
+              raise SystemExit('Porta original do banco inesperada; configuracao local nao alterada')
+          config.write_text(updated)
+          PY
           portas=$(grep -oE '^[[:space:]]*(shadow_)?port[[:space:]]*=[[:space:]]*[0-9]+' supabase/config.toml \
             | grep -oE '[0-9]+$' | sort -un | paste -sd, -)
           test -n "$portas"
@@ -69,6 +81,44 @@ jobs:
       - uses: supabase/setup-cli@v3
         with:
           version: 2.117.0
+
+      - name: Diagnosticar portas locais antes do Supabase
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/feature-a-evidence/ports-before-start.log"
+          {
+            date -u +'%Y-%m-%dT%H:%M:%SZ'
+            printf 'Faixa de portas efemeras: '
+            cat /proc/sys/net/ipv4/ip_local_port_range
+            printf '\nListeners TCP (enderecos, portas e nomes de processos):\n'
+            ss -H -ltnp
+            printf '\nContainers Docker e portas publicadas:\n'
+            docker ps --format '{{.Names}} {{.Ports}}'
+          } > "$log" 2>&1
+          python3 - <<'PY' >> "$log" 2>&1
+          import socket
+          import tomllib
+          from pathlib import Path
+
+          config = tomllib.loads(Path('supabase/config.toml').read_text())
+          ports = {15432, config['api']['port'], config['db']['port'],
+                   config['db']['shadow_port'], config['db']['pooler']['port'],
+                   config['studio']['port'], config['inbucket']['port']}
+          if config['db']['port'] != 15432:
+              raise SystemExit('Porta do banco de QA inesperada')
+          busy = []
+          for port in sorted(ports):
+              with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                  try:
+                      listener.bind(('0.0.0.0', port))
+                  except OSError as error:
+                      busy.append(port)
+                      print(f'Porta {port} indisponivel para bind: {error.strerror}')
+                  else:
+                      print(f'Porta {port} livre para bind IPv4')
+          if busy:
+              raise SystemExit('Portas do Supabase indisponiveis: ' + ', '.join(map(str, busy)))
+          PY
 
       - name: Subir Supabase descartavel sem migrations
         run: |
@@ -92,6 +142,11 @@ jobs:
               exit 0
             fi
             cat "$tentativa_log" >> "$log"
+            {
+              date -u +'%Y-%m-%dT%H:%M:%SZ'
+              ss -H -ltnp
+              docker ps --format '{{.Names}} {{.Ports}}'
+            } > "$RUNNER_TEMP/feature-a-evidence/ports-after-start-failure-${tentativa}.log" 2>&1
             if ! grep -qE 'toomanyrequests|failed to pull docker image|error pulling image|TLS handshake timeout|i/o timeout|connection reset by peer' "$tentativa_log"; then
               echo 'Supabase local falhou; detalhe no artefato criptografado.' >&2
               exit 1
@@ -103,7 +158,7 @@ jobs:
       - name: Preparar extensoes, baseline e chave local
         run: |
           set -euo pipefail
-          db='postgresql://postgres:postgres@127.0.0.1:54322/postgres'
+          db='postgresql://postgres:postgres@127.0.0.1:15432/postgres'
           log="$RUNNER_TEMP/feature-a-evidence/baseline.log"
           psql "$db" -v ON_ERROR_STOP=1 -q > "$log" 2>&1 <<'SQL'
           create schema if not exists extensions;
@@ -153,7 +208,7 @@ jobs:
               raise SystemExit('Variaveis de guarda presentes em .env.e2e: ' + ', '.join(sorted(collision)))
           expected = {
               'NEXT_PUBLIC_SUPABASE_URL': ('127.0.0.1', 54321),
-              'SUPABASE_DB_URL': ('127.0.0.1', 54322),
+              'SUPABASE_DB_URL': ('127.0.0.1', 15432),
               'NEXT_PUBLIC_APP_URL': ('localhost', 3001),
               'WAHA_API_BASE_URL': ('127.0.0.1', 3999),
           }
