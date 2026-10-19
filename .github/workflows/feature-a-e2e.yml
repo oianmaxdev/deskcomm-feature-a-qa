@@ -332,6 +332,7 @@ jobs:
 
       - name: Invariantes A1 de banco, grants e isolamento
         id: db
+        continue-on-error: true
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/feature-a-evidence/db-a1.log"
@@ -518,6 +519,12 @@ jobs:
             echo "Criptografia: ${ENCRYPT_RESULT}"
             echo 'Artefato: pacote age; nenhum arquivo de ambiente ou credencial foi selecionado.'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Exigir aprovacao dos invariantes A1
+        if: always()
+        env:
+          DB_RESULT: ${{ steps.db.outcome }}
+        run: test "$DB_RESULT" = success
 
   unitarios:
     runs-on: ubuntu-24.04
