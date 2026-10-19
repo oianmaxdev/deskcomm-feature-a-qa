@@ -14,7 +14,7 @@ permissions:
 jobs:
   feature-a-e2e:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CI: "true"
       NEXT_TELEMETRY_DISABLED: "1"
@@ -29,13 +29,13 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: oianmaxdev/DeskcommCRM
-          ref: 9cda9e837f124dfaa180a0368e185f89f8b82327
+          ref: 4d76349977ed5196a90c00722c240ae4764af747
           persist-credentials: false
 
       - name: Confirmar identidade do checkout
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = '9cda9e837f124dfaa180a0368e185f89f8b82327'
+          test "$(git rev-parse HEAD)" = '4d76349977ed5196a90c00722c240ae4764af747'
           test ! -e .env.local
           test -f .github/actions/preparar-node/action.yml
           test -f supabase/baseline.sql
@@ -245,6 +245,54 @@ jobs:
           fi
           exit "$code"
 
+      - name: Gates estaticos de contribuicao
+        id: static
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/feature-a-evidence"
+          for gate in lint lint:channels lint:role-rank; do
+            label=${gate//:/-}
+            set +e
+            pnpm "$gate" > "$evidence/$label.log" 2>&1
+            code=$?
+            set -e
+            printf '%s\n' "$code" > "$evidence/$label.exit-code"
+            if [ "$code" -ne 0 ]; then
+              echo "Gate $gate falhou; detalhe no artefato criptografado." >&2
+              exit "$code"
+            fi
+          done
+
+      - name: Suite unitaria completa do produto
+        id: unit
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/feature-a-evidence/unit.log"
+          set +e
+          pnpm test:unit --no-file-parallelism --maxWorkers=1 > "$log" 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > "$RUNNER_TEMP/feature-a-evidence/unit.exit-code"
+          if [ "$code" -ne 0 ]; then
+            echo 'Suite unitaria falhou; detalhe no artefato criptografado.' >&2
+          fi
+          exit "$code"
+
+      - name: Invariantes A1 de banco, grants e isolamento
+        id: db
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/feature-a-evidence/db-a1.log"
+          set +e
+          pnpm test:db tests/invariants/meta-lead-por-clique.test.ts > "$log" 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > "$RUNNER_TEMP/feature-a-evidence/db-a1.exit-code"
+          if [ "$code" -ne 0 ]; then
+            echo 'Invariantes A1 de banco falharam; detalhe no artefato criptografado.' >&2
+          fi
+          exit "$code"
+
       - name: Build oficial do E2E
         id: build
         run: |
@@ -399,6 +447,9 @@ jobs:
         if: always()
         env:
           TYPECHECK_RESULT: ${{ steps.typecheck.outcome }}
+          STATIC_RESULT: ${{ steps.static.outcome }}
+          UNIT_RESULT: ${{ steps.unit.outcome }}
+          DB_RESULT: ${{ steps.db.outcome }}
           BUILD_RESULT: ${{ steps.build.outcome }}
           CAUSAL_RESULT: ${{ steps.causal.outcome }}
           REGRESSION_RESULT: ${{ steps.regression.outcome }}
@@ -406,8 +457,11 @@ jobs:
         run: |
           {
             echo '## Feature A E2E'
-            echo 'Checkpoint: `9cda9e837f124dfaa180a0368e185f89f8b82327`'
+            echo 'Checkpoint: `4d76349977ed5196a90c00722c240ae4764af747`'
             echo "Typecheck: ${TYPECHECK_RESULT}"
+            echo "Gates estaticos: ${STATIC_RESULT}"
+            echo "Unitarios: ${UNIT_RESULT}"
+            echo "Banco A1: ${DB_RESULT}"
             echo "Build: ${BUILD_RESULT}"
             echo "Causal (dez cenarios): ${CAUSAL_RESULT}"
             echo "Regressao (duas specs): ${REGRESSION_RESULT}"
