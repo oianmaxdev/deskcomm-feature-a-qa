@@ -241,6 +241,17 @@ jobs:
           if os.environ.get('WAHA_WEBHOOK_REQUIRE_SIGNATURE') != 'false':
               raise SystemExit('WAHA padrao precisa permanecer sem assinatura obrigatoria')
           PY
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for line in Path('.env.e2e').read_text().splitlines():
+              if not line or line.lstrip().startswith('#') or '=' not in line:
+                  continue
+              key, value = line.split('=', 1)
+              if value and (key.endswith(('_KEY', '_TOKEN', '_SECRET', '_PASSWORD'))
+                            or key in ('SUPABASE_DB_URL', 'OWNER_EMAIL')):
+                  print(f'::add-mask::{value}')
+          PY
           grep -vE '^[[:space:]]*(#|$)' .env.e2e >> "$GITHUB_ENV"
           echo 'Ambiente E2E conferido: somente destinos locais.'
 
