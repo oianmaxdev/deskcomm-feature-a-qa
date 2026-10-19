@@ -155,6 +155,18 @@ jobs:
           echo 'Supabase local falhou apos quatro tentativas de download; detalhe no artefato criptografado.' >&2
           exit 1
 
+      - name: Restaurar migrations do checkout para os testes
+        run: |
+          set -euo pipefail
+          origem="$RUNNER_TEMP/feature-a-migrations"
+          test -f "$origem/MANIFEST.md"
+          test -d supabase/migrations
+          test -z "$(find supabase/migrations -mindepth 1 -print -quit)"
+          rmdir supabase/migrations
+          mv "$origem" supabase/migrations
+          test -f supabase/migrations/MANIFEST.md
+          test "$(git status --porcelain -- supabase/migrations | wc -l)" -eq 0
+
       - name: Preparar extensoes, baseline e chave local
         run: |
           set -euo pipefail
@@ -317,21 +329,6 @@ jobs:
               exit "$code"
             fi
           done
-
-      - name: Suite unitaria completa do produto
-        id: unit
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/feature-a-evidence/unit.log"
-          set +e
-          pnpm test:unit --no-file-parallelism --maxWorkers=1 > "$log" 2>&1
-          code=$?
-          set -e
-          printf '%s\n' "$code" > "$RUNNER_TEMP/feature-a-evidence/unit.exit-code"
-          if [ "$code" -ne 0 ]; then
-            echo 'Suite unitaria falhou; detalhe no artefato criptografado.' >&2
-          fi
-          exit "$code"
 
       - name: Invariantes A1 de banco, grants e isolamento
         id: db
@@ -503,7 +500,6 @@ jobs:
         env:
           TYPECHECK_RESULT: ${{ steps.typecheck.outcome }}
           STATIC_RESULT: ${{ steps.static.outcome }}
-          UNIT_RESULT: ${{ steps.unit.outcome }}
           DB_RESULT: ${{ steps.db.outcome }}
           BUILD_RESULT: ${{ steps.build.outcome }}
           CAUSAL_RESULT: ${{ steps.causal.outcome }}
@@ -515,7 +511,6 @@ jobs:
             echo 'Checkpoint: `4d76349977ed5196a90c00722c240ae4764af747`'
             echo "Typecheck: ${TYPECHECK_RESULT}"
             echo "Gates estaticos: ${STATIC_RESULT}"
-            echo "Unitarios: ${UNIT_RESULT}"
             echo "Banco A1: ${DB_RESULT}"
             echo "Build: ${BUILD_RESULT}"
             echo "Causal (dez cenarios): ${CAUSAL_RESULT}"
@@ -523,3 +518,121 @@ jobs:
             echo "Criptografia: ${ENCRYPT_RESULT}"
             echo 'Artefato: pacote age; nenhum arquivo de ambiente ou credencial foi selecionado.'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  unitarios:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        parte: [1, 2, 3]
+    env:
+      CI: "true"
+      EVIDENCE_RECIPIENT: ${{ inputs.evidence_recipient }}
+    steps:
+      - name: Checkout do mesmo commit do produto
+        uses: actions/checkout@v7
+        with:
+          repository: oianmaxdev/DeskcommCRM
+          ref: 4d76349977ed5196a90c00722c240ae4764af747
+          persist-credentials: false
+
+      - name: Conferir identidade e ambiente unitario limpo
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '4d76349977ed5196a90c00722c240ae4764af747'
+          test -f supabase/migrations/MANIFEST.md
+          test ! -e .env.local
+          test ! -e .env.e2e
+          for name in META_GRAPH_BASE_URL META_ADS_GRAPH_BASE_URL SUPABASE_DB_URL \
+            NEXT_PUBLIC_SUPABASE_URL WAHA_API_BASE_URL; do
+            if printenv "$name" >/dev/null; then
+              echo "Variavel E2E indevida na suite unitaria: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Preparar criptografia das evidencias unitarias
+        id: encryption
+        run: |
+          set -euo pipefail
+          umask 077
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq age >/dev/null
+          mkdir -p "$RUNNER_TEMP/feature-a-unit-evidence"
+          printf 'teste\n' | age -r "$EVIDENCE_RECIPIENT" \
+            -o "$RUNNER_TEMP/feature-a-unit-evidence/recipient-probe.age"
+          test -s "$RUNNER_TEMP/feature-a-unit-evidence/recipient-probe.age"
+
+      - uses: ./.github/actions/preparar-node
+        timeout-minutes: 5
+
+      - name: Cercas estruturais do CI oficial
+        if: matrix.parte == 3
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/feature-a-unit-evidence"
+          set +e
+          pnpm cercas > "$evidence/cercas.log" 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > "$evidence/cercas.exit-code"
+          if [ "$code" -ne 0 ]; then
+            echo 'Cercas estruturais falharam; detalhe no artefato criptografado.' >&2
+          fi
+          exit "$code"
+
+      - name: Unit tests (parte ${{ matrix.parte }}/3)
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/feature-a-unit-evidence"
+          set +e
+          pnpm test:unit --project produto --shard=${{ matrix.parte }}/3 \
+            > "$evidence/unit-parte-${{ matrix.parte }}.log" 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > "$evidence/unit-parte-${{ matrix.parte }}.exit-code"
+          if [ "$code" -ne 0 ]; then
+            echo 'Shard unitario falhou; detalhe no artefato criptografado.' >&2
+          fi
+          exit "$code"
+
+      - name: Criptografar evidencias unitarias
+        id: encrypt
+        if: ${{ always() && steps.encryption.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          evidence="$RUNNER_TEMP/feature-a-unit-evidence"
+          tar -czf "$RUNNER_TEMP/feature-a-unit-${{ matrix.parte }}.tar.gz" -C "$evidence" .
+          age -r "$EVIDENCE_RECIPIENT" \
+            -o "$RUNNER_TEMP/feature-a-unit-${{ matrix.parte }}.tar.gz.age" \
+            "$RUNNER_TEMP/feature-a-unit-${{ matrix.parte }}.tar.gz"
+          test -s "$RUNNER_TEMP/feature-a-unit-${{ matrix.parte }}.tar.gz.age"
+
+      - name: Publicar somente evidencias unitarias criptografadas
+        if: ${{ always() && steps.encrypt.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: feature-a-unit-parte-${{ matrix.parte }}-evidencias-criptografadas
+          path: ${{ runner.temp }}/feature-a-unit-${{ matrix.parte }}.tar.gz.age
+          if-no-files-found: error
+          retention-days: 14
+
+  homologacao:
+    runs-on: ubuntu-24.04
+    needs: [feature-a-e2e, unitarios]
+    if: always()
+    env:
+      E2E_RESULT: ${{ needs.feature-a-e2e.result }}
+      UNIT_RESULT: ${{ needs.unitarios.result }}
+    steps:
+      - name: Exigir todos os gates obrigatorios
+        run: |
+          {
+            echo '## Feature A A1 — resultado agregado'
+            echo "E2E e banco: ${E2E_RESULT}"
+            echo "Tres shards unitarios e cercas: ${UNIT_RESULT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$E2E_RESULT" = success
+          test "$UNIT_RESULT" = success
